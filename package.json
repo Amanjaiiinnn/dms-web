@@ -1,0 +1,12 @@
+{
+  "name": "dms-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Driver monitoring (drowsiness, yawning, distraction, phone use) running in the browser with MediaPipe.",
+  "type": "module",
+  "scripts": {
+    "start": "python -m http.server 8000",
+    "test": "node --test"
+  },
+  "license": "MIT"
+}
