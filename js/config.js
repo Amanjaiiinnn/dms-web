@@ -7,8 +7,14 @@ export const WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${
 
 export const FACE_MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
-export const PHONE_MODEL_URL =
-  "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/int8/1/efficientdet_lite0.tflite";
+
+// Custom YOLOv8n phone + cigarette detector, the same INT8 model the board runs,
+// with a float32 input/output wrapper added (see tools/make_float_io_model.py).
+// It runs with LiteRT.js, Google's runtime for .tflite models in the browser.
+export const DETECTOR_MODEL_URL = new URL("../models/phone_smoke.tflite", import.meta.url).href;
+export const LITERT_VERSION = "2.5.3";
+export const LITERT_URL = `https://cdn.jsdelivr.net/npm/@litertjs/core@${LITERT_VERSION}/+esm`;
+export const LITERT_WASM_URL = `https://cdn.jsdelivr.net/npm/@litertjs/core@${LITERT_VERSION}/wasm/`;
 
 // Every threshold can be changed live in the page's Tuning panel.
 export const DEFAULT_THRESHOLDS = {
@@ -17,7 +23,11 @@ export const DEFAULT_THRESHOLDS = {
   facingMin: 0.5,   // board: lip-to-cheek distance ratio; outside [min, max] = head turned
   facingMax: 2.0,   // board
   headDown: 0.58,   // board: nose position between forehead (0) and chin (1)
-  phone: 0.4,       // phone detector confidence, counted only near the face
+  // Detector probabilities, counted only near the face. The board applies a
+  // second sigmoid to scores that are already probabilities and uses 0.55 / 0.60
+  // on that scale; 0.20 / 0.40 are the same cut-offs as plain probabilities.
+  phone: 0.2,
+  smoking: 0.4,
 };
 
 // How long a condition must last before it becomes an alert (seconds).
@@ -29,8 +39,10 @@ export const HOLD_SECONDS = {
   headDown: 0.5,
 };
 
-export const PHONE_CHECK_MS = 150;   // run the phone detector at most this often
-export const PHONE_MEMORY_MS = 600;  // "phone" stays active this long after the last sighting
+export const DETECT_EVERY_MS = 150;   // run the phone/cigarette detector at most this often
+export const DETECT_MEMORY_MS = 600;  // an alert stays active this long after the last sighting
+export const DETECT_FLOOR = 0.05;     // lowest score kept, so the Tuning panel can show live values
+export const NMS_IOU = 0.4;           // board: overlapping boxes above this IoU are merged
 
 // Risk score. The board adds these points on every frame. Here they are scaled
 // by elapsed time × REF_FPS, so the score moves at the same speed on a 15 FPS
@@ -42,6 +54,7 @@ export const PENALTY = {
   yawn: 7,
   headDown: 5,
   phone: 2,
+  smoking: 2,
 };
 export const NO_FACE_PENALTY = 0.7;
 export const RESTORE_CREDIT = -5;  // per frame with a face and no alerts

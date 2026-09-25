@@ -42,8 +42,23 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 MediaPipe (Google)
 --------------------------------------------------------------------------------
 
-The MediaPipe Tasks Vision library (@mediapipe/tasks-vision), the Face
-Landmarker model and the EfficientDet-Lite0 object detection model are loaded
-at runtime from public CDNs. They are not included in this repository.
-MediaPipe is licensed under the Apache License 2.0:
+The MediaPipe Tasks Vision library (@mediapipe/tasks-vision) and the Face
+Landmarker model are loaded at runtime from public CDNs. They are not included
+in this repository. MediaPipe is licensed under the Apache License 2.0:
 https://github.com/google-ai-edge/mediapipe/blob/master/LICENSE
+
+--------------------------------------------------------------------------------
+LiteRT.js (Google)
+--------------------------------------------------------------------------------
+
+The LiteRT.js runtime (@litertjs/core) is loaded at runtime from a public CDN
+and is not included in this repository. It is licensed under the Apache
+License 2.0.
+
+--------------------------------------------------------------------------------
+Ultralytics YOLOv8
+--------------------------------------------------------------------------------
+
+models/phone_smoke.tflite was trained and exported with Ultralytics YOLOv8,
+which is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0):
+https://github.com/ultralytics/ultralytics/blob/main/LICENSE

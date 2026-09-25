@@ -1,13 +1,16 @@
 import {
   DEFAULT_THRESHOLDS,
+  DETECT_EVERY_MS,
+  DETECT_FLOOR,
+  DETECT_MEMORY_MS,
   FACE_MODEL_URL,
   HOLD_SECONDS,
   MEDIAPIPE_URL,
-  PHONE_CHECK_MS,
-  PHONE_MEMORY_MS,
-  PHONE_MODEL_URL,
+  NMS_IOU,
   WASM_URL,
 } from "./config.js";
+import { PhoneSmokeDetector } from "./detector.js";
+import { CLASSES, nms } from "./yolo.js";
 import {
   Hold,
   KEY_POINTS,
@@ -29,6 +32,7 @@ const ALERT_LABELS = {
   distracted: "Distracted",
   headDown: "Head down",
   phone: "Phone use",
+  smoking: "Smoking",
 };
 
 const STATUS_LABELS = {
@@ -42,7 +46,10 @@ const STATUS_LABELS = {
 // Drawn on top of the video, so the same in light and dark mode.
 const DRAW_COLORS = { ok: "#4ade80", warning: "#fbbf24", danger: "#f87171", noface: "#94a3b8" };
 const KEY_POINT_COLOR = "#38bdf8";
-const PHONE_COLOR = "#fb923c";
+const OBJECT_STYLE = {
+  phone: { color: "#fb923c", label: "Phone" },
+  smoking: { color: "#c084fc", label: "Cigarette" },
+};
 
 // Rows of the Tuning panel. `above`: the alert fires when the live value is above the threshold.
 const TUNING = [
@@ -51,7 +58,8 @@ const TUNING = [
   { key: "facingMin", measure: "facing", label: "Head turned (low)", hint: "Alert below this cheek ratio", min: 0.2, max: 1, step: 0.01, above: false },
   { key: "facingMax", measure: "facing", label: "Head turned (high)", hint: "Alert above this cheek ratio", min: 1, max: 4, step: 0.05, above: true },
   { key: "headDown", measure: "headDown", label: "Head down", hint: "Nose between forehead (0) and chin (1)", min: 0.4, max: 0.8, step: 0.01, above: true },
-  { key: "phone", measure: "phone", label: "Phone", hint: "Detector confidence near the face", min: 0.1, max: 0.9, step: 0.05, above: true },
+  { key: "phone", measure: "phone", label: "Phone", hint: "Model probability near the face", min: 0.05, max: 0.95, step: 0.01, above: true },
+  { key: "smoking", measure: "smoking", label: "Cigarette", hint: "Model probability near the face", min: 0.05, max: 0.95, step: 0.01, above: true },
 ];
 
 // localStorage can be unavailable (private mode, blocked site data). Settings then just don't persist.
@@ -109,7 +117,7 @@ let showMesh = storage.get("dms.mesh", true) !== false;
 let thresholds = loadThresholds();
 
 let faceLandmarker = null;
-let phoneDetector = null;
+let objectDetector = null; // custom phone + cigarette model
 
 // Session state
 let running = false;
@@ -131,10 +139,11 @@ let alerts = noAlerts();
 let prevAlerts = noAlerts();
 let prevStatus = "idle";
 let measures = null;
-let phoneBoxes = [];
-let lastPhoneCheck = -Infinity;
-let lastPhoneSeen = -Infinity;
-let lastPhoneScore = 0;
+let objectBoxes = [];        // phone / cigarette boxes near the face from the latest check
+let detectBusy = false;      // the detector runs asynchronously; one check at a time
+let lastDetect = -Infinity;
+let lastSeen = noSightings(); // per class: when it was last detected
+let lastScores = noScores();  // per class: best score near the face in the latest check
 let faceLostSince = null;
 let faceLostLogged = false;
 
@@ -151,40 +160,21 @@ const modelsReady = loadModels();
 
 async function loadModels() {
   try {
-    loadText.textContent = "Loading MediaPipe…";
-    const { FilesetResolver, FaceLandmarker, ObjectDetector } = await import(MEDIAPIPE_URL);
-    const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
-
-    loadText.textContent = "Loading face model…";
-    const faceOptions = (delegate) => ({
-      baseOptions: { modelAssetPath: FACE_MODEL_URL, delegate },
-      runningMode: "VIDEO",
-      numFaces: 2,
-      outputFaceBlendshapes: true,
-    });
-    let delegate = "GPU";
-    try {
-      faceLandmarker = await FaceLandmarker.createFromOptions(fileset, faceOptions("GPU"));
-    } catch (err) {
-      console.warn("GPU not available, using CPU:", err);
-      delegate = "CPU";
-      faceLandmarker = await FaceLandmarker.createFromOptions(fileset, faceOptions("CPU"));
-    }
-    backendText.textContent = delegate;
-
-    loadText.textContent = "Loading phone model…";
-    try {
-      phoneDetector = await ObjectDetector.createFromOptions(fileset, {
-        baseOptions: { modelAssetPath: PHONE_MODEL_URL, delegate: "CPU" },
-        runningMode: "VIDEO",
-        scoreThreshold: 0.2, // low on purpose: the Tuning threshold is applied afterwards
-        maxResults: 3,
-        categoryAllowlist: ["cell phone"],
-      });
-    } catch (err) {
-      console.warn("Phone detector unavailable:", err);
-      alertItems.phone.dataset.unavailable = "true";
-      alertItems.phone.querySelector(".state").textContent = "Unavailable";
+    loadText.textContent = "Loading models…";
+    // The face model is required; the phone/cigarette model is optional.
+    const [, detector] = await Promise.all([
+      loadFaceLandmarker(),
+      PhoneSmokeDetector.create().catch((err) => {
+        console.warn("Phone/cigarette detector unavailable:", err);
+        return null;
+      }),
+    ]);
+    objectDetector = detector;
+    if (!detector) {
+      for (const key of CLASSES) {
+        alertItems[key].dataset.unavailable = "true";
+        alertItems[key].querySelector(".state").textContent = "Unavailable";
+      }
     }
 
     loadText.textContent = "Models ready";
@@ -199,6 +189,26 @@ async function loadModels() {
     );
     return false;
   }
+}
+
+async function loadFaceLandmarker() {
+  const { FilesetResolver, FaceLandmarker } = await import(MEDIAPIPE_URL);
+  const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
+  const options = (delegate) => ({
+    baseOptions: { modelAssetPath: FACE_MODEL_URL, delegate },
+    runningMode: "VIDEO",
+    numFaces: 2,
+    outputFaceBlendshapes: true,
+  });
+  let delegate = "GPU";
+  try {
+    faceLandmarker = await FaceLandmarker.createFromOptions(fileset, options("GPU"));
+  } catch (err) {
+    console.warn("GPU not available, using CPU:", err);
+    delegate = "CPU";
+    faceLandmarker = await FaceLandmarker.createFromOptions(fileset, options("CPU"));
+  }
+  backendText.textContent = delegate;
 }
 
 // ─── Starting and stopping ──────────────────────────────────────────────────
@@ -354,10 +364,10 @@ function resetDetection() {
   prevStatus = "idle";
   measures = null;
   Object.values(holds).forEach((h) => h.reset());
-  phoneBoxes = [];
-  lastPhoneCheck = -Infinity;
-  lastPhoneSeen = -Infinity;
-  lastPhoneScore = 0;
+  objectBoxes = [];
+  lastDetect = -Infinity;
+  lastSeen = noSightings();
+  lastScores = noScores();
   faceLostSince = null;
   faceLostLogged = false;
   lastVideoTime = -1;
@@ -407,7 +417,7 @@ function processFrame(now, dt) {
       yawn: yawnRatio(points),
       facing: facingRatio(points),
       headDown: headDownRatio(points),
-      phone: lastPhoneScore,
+      ...lastScores,
     };
 
     alerts.drowsy = holds.drowsy.update(measures.eyes > thresholds.eyeClosed, nowSec);
@@ -418,19 +428,18 @@ function processFrame(now, dt) {
     );
     alerts.headDown = holds.headDown.update(measures.headDown > thresholds.headDown, nowSec);
 
-    if (phoneDetector && now - lastPhoneCheck >= PHONE_CHECK_MS) {
-      lastPhoneCheck = now;
-      checkForPhone(now, boxes[i], w, h);
-      measures.phone = lastPhoneScore;
+    if (objectDetector && !detectBusy && now - lastDetect >= DETECT_EVERY_MS) {
+      lastDetect = now;
+      detectObjects(boxes[i], w, h);
     }
-    alerts.phone = now - lastPhoneSeen < PHONE_MEMORY_MS;
+    for (const key of CLASSES) alerts[key] = now - lastSeen[key] < DETECT_MEMORY_MS;
   } else {
     Object.values(holds).forEach((hold) => hold.reset());
     alerts = noAlerts();
     measures = null;
-    phoneBoxes = [];
-    lastPhoneSeen = -Infinity;
-    lastPhoneScore = 0;
+    objectBoxes = [];
+    lastSeen = noSightings();
+    lastScores = noScores();
   }
 
   score = updateScore(score, alerts, faceFound, dt);
@@ -449,25 +458,33 @@ function processFrame(now, dt) {
   }
 }
 
-function checkForPhone(now, face, width, height) {
-  const { detections } = phoneDetector.detectForVideo(video, now);
-  phoneBoxes = [];
-  lastPhoneScore = 0;
-  for (const d of detections) {
-    const b = d.boundingBox;
-    if (!b) continue;
-    const box = {
-      x1: b.originX,
-      y1: b.originY,
-      x2: b.originX + b.width,
-      y2: b.originY + b.height,
-      score: d.categories[0]?.score ?? 0,
-    };
-    if (!isNearFace(box, face, width, height)) continue;
-    lastPhoneScore = Math.max(lastPhoneScore, box.score);
-    if (box.score >= thresholds.phone) phoneBoxes.push(box);
+/**
+ * Runs the phone/cigarette model on the current frame in the background.
+ * Same order as the board: class threshold, then NMS, then keep boxes near the face.
+ */
+async function detectObjects(face, width, height) {
+  const session = beginToken;
+  detectBusy = true;
+  try {
+    const candidates = await objectDetector.detect(video, width, height, DETECT_FLOOR);
+    if (session !== beginToken || !running) return; // stopped or restarted meanwhile
+
+    const scores = noScores();
+    for (const b of candidates) {
+      const key = CLASSES[b.cls];
+      if (b.score > scores[key] && isNearFace(b, face, width, height)) scores[key] = b.score;
+    }
+    lastScores = scores;
+
+    const passing = candidates.filter((b) => b.score >= thresholds[CLASSES[b.cls]]);
+    objectBoxes = nms(passing, NMS_IOU).filter((b) => isNearFace(b, face, width, height));
+    const seenAt = performance.now();
+    for (const b of objectBoxes) lastSeen[CLASSES[b.cls]] = seenAt;
+  } catch (err) {
+    console.warn("Phone/cigarette detection failed:", err);
+  } finally {
+    detectBusy = false;
   }
-  if (phoneBoxes.length) lastPhoneSeen = now;
 }
 
 // ─── Drawing ────────────────────────────────────────────────────────────────
@@ -501,22 +518,24 @@ function draw(points, face, status) {
     drawCorners(mirrorBox(face, pad, w), 18 * unit);
   }
 
-  if (alerts.phone) {
-    ctx.font = `600 ${Math.round(13 * unit)}px system-ui, sans-serif`;
-    ctx.textBaseline = "bottom";
-    for (const b of phoneBoxes) {
-      const r = mirrorBox(b, 0, w);
-      ctx.strokeStyle = PHONE_COLOR;
-      ctx.lineWidth = 2.5 * unit;
-      ctx.strokeRect(r.x, r.y, r.w, r.h);
-      const label = `Phone ${Math.round(b.score * 100)}%`;
-      const tw = ctx.measureText(label).width + 10 * unit;
-      const th = 20 * unit;
-      ctx.fillStyle = PHONE_COLOR;
-      ctx.fillRect(r.x, r.y - th, tw, th);
-      ctx.fillStyle = "#1c1917";
-      ctx.fillText(label, r.x + 5 * unit, r.y - 4 * unit);
-    }
+  ctx.font = `600 ${Math.round(13 * unit)}px system-ui, sans-serif`;
+  ctx.textBaseline = "bottom";
+  for (const b of objectBoxes) {
+    const key = CLASSES[b.cls];
+    if (!alerts[key]) continue;
+    const { color, label } = OBJECT_STYLE[key];
+    const r = mirrorBox(b, 0, w);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.5 * unit;
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+    const text = `${label} ${Math.round(b.score * 100)}%`;
+    const tw = ctx.measureText(text).width + 10 * unit;
+    const th = 20 * unit;
+    const ty = Math.max(th, r.y); // keep the label on screen for boxes touching the top
+    ctx.fillStyle = color;
+    ctx.fillRect(r.x, ty - th, tw, th);
+    ctx.fillStyle = "#1c1917";
+    ctx.fillText(text, r.x + 5 * unit, ty - 4 * unit);
   }
 }
 
@@ -657,6 +676,14 @@ function cameraError(err) {
 
 function noAlerts() {
   return Object.fromEntries(Object.keys(ALERT_LABELS).map((key) => [key, false]));
+}
+
+function noSightings() {
+  return Object.fromEntries(CLASSES.map((key) => [key, -Infinity]));
+}
+
+function noScores() {
+  return Object.fromEntries(CLASSES.map((key) => [key, 0]));
 }
 
 // ─── Settings ───────────────────────────────────────────────────────────────
